@@ -1,0 +1,23 @@
+syntax = "proto3";
+
+package mcp;
+
+import "google/protobuf/descriptor.proto";
+
+// MCP Tool Options
+extend google.protobuf.ServiceOptions {
+    string mcp_name = 65536;
+    string mcp_version = 65537;
+    string mcp_description = 65538;
+}
+
+// MCP Method Options
+extend google.protobuf.MethodOptions {
+    string mcp_tool_name = 32768;
+    string mcp_tool_description = 32769;
+}
+
+// MCP Object Options
+extend google.protobuf.FieldOptions {
+    bool field_required = 16384;
+}

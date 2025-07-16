@@ -1,0 +1,24 @@
+syntax = "proto3";
+
+package helloworld;
+
+import "google/api/annotations.proto";
+import "google/api/http.proto";
+import "mcpoptions/mcp_options.proto";
+import "helloworld/hello_messages.proto";
+
+service Greeter {
+  option (mcp.mcp_name) = "GreeterService";
+  option (mcp.mcp_version) = "1.0.0";
+  option (mcp.mcp_description) = "A service that provides greeting functionality";
+
+  // Sends a greeting
+  rpc SayHello (HelloRequest) returns (HelloReply) {
+    option (mcp.mcp_tool_name) = "say_hello";
+    option (mcp.mcp_tool_description) = "Sends a personalized greeting message";
+    option (google.api.http) = {
+      post: "/v1/example/hello"
+      body: "*"
+    };
+  }
+}

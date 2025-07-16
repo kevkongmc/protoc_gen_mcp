@@ -1,0 +1,540 @@
+#!/usr/bin/env python3
+"""
+Unified protobuf code generator that generates:
+- An MCP proxy that routes to an underlying gRPC server.
+- An accompanying MCP manifest, so that an LLM can use the MCP proxy.
+"""
+
+import json
+import sys
+from typing import Any, Dict, List, Optional
+from google.protobuf.compiler import plugin_pb2
+from google.protobuf.descriptor_pb2 import FileDescriptorProto, ServiceDescriptorProto, MethodDescriptorProto, DescriptorProto
+
+from mcpoptions import mcp_options_pb2
+from google.api import annotations_pb2
+
+MCP_VERSION = "2024-11-05"
+
+
+def get_service_options(service: ServiceDescriptorProto) -> Dict[str, Any]:
+    """Extract MCP tool options from a service descriptor."""
+    options = {}
+    
+    try:
+        # Get the service options
+        service_options = service.options
+        if service_options:
+            # Use the generated extension to get the values
+            if service_options.HasExtension(mcp_options_pb2.mcp_name):
+                options['name'] = service_options.Extensions[mcp_options_pb2.mcp_name]
+            if service_options.HasExtension(mcp_options_pb2.mcp_version):
+                options['version'] = service_options.Extensions[mcp_options_pb2.mcp_version]
+            if service_options.HasExtension(mcp_options_pb2.mcp_description):
+                options['description'] = service_options.Extensions[mcp_options_pb2.mcp_description]
+    except Exception as e:
+        sys.stderr.write(f"Warning: Could not extract service options: {str(e)}\n")
+    
+    return options
+
+def get_tool_options(method: MethodDescriptorProto) -> Dict[str, Any]:
+    """Extract MCP method options from a method descriptor."""
+    method_info = {}
+    try:
+        method_options = method.options
+        if not method_options:
+            return method_info
+            
+        # Get MCP tool options
+        if method_options.HasExtension(mcp_options_pb2.mcp_tool_name):
+            method_info['name'] = method_options.Extensions[mcp_options_pb2.mcp_tool_name]
+        if method_options.HasExtension(mcp_options_pb2.mcp_tool_description):
+            method_info['description'] = method_options.Extensions[mcp_options_pb2.mcp_tool_description]
+    
+    except Exception as e:
+        print(f"Warning: Could not extract method options: {str(e)}", file=sys.stderr)
+    
+    return method_info
+
+def get_field_options(field) -> Dict[str, Any]:
+    """Extract MCP field options from a field descriptor."""
+    field_info = {}
+    try:
+        field_options = field.options
+        if field_options:
+            # Get MCP field options
+            if field_options.HasExtension(mcp_options_pb2.field_required):
+                field_info['required'] = field_options.Extensions[mcp_options_pb2.field_required]
+    except Exception as e:
+        print(f"Warning: Could not extract field options: {str(e)}", file=sys.stderr)
+    
+    return field_info
+
+def generate_json_schema_from_proto_message(message_desc: DescriptorProto) -> Dict[str, Any]:
+    """Generate JSON schema for a protobuf message descriptor."""
+    # Map protobuf field types to JSON schema types
+    type_mapping = {
+        1: "number",       # TYPE_DOUBLE
+        2: "number",       # TYPE_FLOAT
+        3: "integer",      # TYPE_INT64
+        4: "integer",      # TYPE_UINT64
+        5: "integer",      # TYPE_INT32
+        6: "integer",      # TYPE_FIXED64
+        7: "integer",      # TYPE_FIXED32
+        8: "boolean",      # TYPE_BOOL
+        9: "string",       # TYPE_STRING
+        10: "object",      # TYPE_GROUP (deprecated)
+        11: "object",      # TYPE_MESSAGE
+        12: "string",      # TYPE_BYTES (base64 encoded)
+        13: "integer",     # TYPE_UINT32
+        14: "integer",     # TYPE_ENUM
+        15: "integer",     # TYPE_SFIXED32
+        16: "integer",     # TYPE_SFIXED64
+        17: "integer",     # TYPE_SINT32
+        18: "integer",     # TYPE_SINT64
+    }
+    
+    properties = {}
+    required = []
+    
+    for field in message_desc.field:
+        field_name = field.name
+        json_type = type_mapping.get(field.type, "string")
+        
+        # Handle repeated fields
+        if field.label == 3:  # LABEL_REPEATED
+            field_schema = {
+                "type": "array",
+                "items": {"type": json_type}
+            }
+        else:
+            field_schema = {"type": json_type}
+        
+        # TODO: Handle nested fields (proto in proto)
+            
+        # Check if field is marked as required via MCP options
+        field_options = get_field_options(field)
+        if field_options.get('required', False):
+            required.append(field_name)
+            
+        properties[field_name] = field_schema
+    
+    schema = {
+        "type": "object",
+        "properties": properties
+    }
+    
+    if required:
+        schema["required"] = required
+        
+    return schema
+
+def generate_json_schema_from_proto_type(proto_type: str, proto_file: FileDescriptorProto, all_proto_files: Optional[List[FileDescriptorProto]] = None) -> Dict[str, Any]:
+    """Generate JSON schema for a protobuf message type."""
+    # Extract just the message name (remove package prefix)
+    message_name = proto_type.split('.')[-1]
+    
+    # Find the message descriptor
+    message_desc = find_message_by_name(proto_file, message_name, all_proto_files)
+    
+    if message_desc:
+        return generate_json_schema_from_proto_message(message_desc)
+    
+    # Default schema for unknown types
+    return {"type": "object"}
+
+def process_service_for_mcp(service: ServiceDescriptorProto, proto_file: FileDescriptorProto, all_proto_files: Optional[List[FileDescriptorProto]] = None) -> List[Dict[str, Any]]:
+    """Process a service and its methods to extract tool information for MCP."""
+    tools = []
+    
+    # Process each method in the service as a separate tool
+    for method in service.method:
+        # Get method-specific options
+        method_options = get_tool_options(method)
+        
+        # Create MCP tool definition
+        tool = {}
+        
+        # Set tool name
+        if 'name' in method_options:
+            tool['name'] = method_options['name']
+        else:
+            tool['name'] = f"{service.name.lower()}_{method.name.lower()}"
+        
+        # Set tool description
+        if 'description' in method_options:
+            tool['description'] = method_options['description']
+        else:
+            tool['description'] = f"Process {method.name} request"
+        
+        # Generate input schema from protobuf message
+        input_type = method.input_type[1:] if method.input_type.startswith('.') else method.input_type
+        tool['inputSchema'] = generate_json_schema_from_proto_type(input_type, proto_file, all_proto_files)
+        
+        # Generate output schema from protobuf message
+        output_type = method.output_type[1:] if method.output_type.startswith('.') else method.output_type
+        tool['outputSchema'] = generate_json_schema_from_proto_type(output_type, proto_file, all_proto_files)
+        
+        tools.append(tool)
+    
+    return tools
+
+def generate_mcp_manifest(proto_file: FileDescriptorProto, all_proto_files: Optional[List[FileDescriptorProto]] = None) -> Dict[str, Any]:
+    """Process a proto file and generate MCP manifest."""
+    if not proto_file.service:
+        return {}
+    
+    # Create MCP manifest
+    manifest: Dict[str, Any] = {
+        "mcpVersion": MCP_VERSION
+    }
+    
+    # Use defaults
+    manifest['name'] = proto_file.package or proto_file.name.replace('.proto', '')
+    manifest['version'] = '1.0.0'
+    manifest['description'] = f"Generated from {proto_file.name}"
+    
+    # If there's only one service, use its metadata for the manifest
+    if len(proto_file.service) == 1:
+        service_options = get_service_options(proto_file.service[0])
+        if 'name' in service_options:
+            manifest['name'] = service_options['name']
+        if 'version' in service_options:
+            manifest['version'] = service_options['version']
+        if 'description' in service_options:
+            manifest['description'] = service_options['description']
+    
+    # Add server configuration
+    manifest['server'] = {
+        "transport": {
+            "type": "stdio"
+        }
+    }
+    
+    # Process all services and collect their tools
+    all_tools = []
+    for service in proto_file.service:
+        tools = process_service_for_mcp(service, proto_file, all_proto_files)
+        all_tools.extend(tools)
+    
+    if all_tools:
+        manifest['tools'] = all_tools
+    
+    return manifest
+
+
+def find_message_by_name(proto_file: FileDescriptorProto, message_name: str, all_proto_files: Optional[List[FileDescriptorProto]] = None) -> Optional[DescriptorProto]:
+    """Find a message descriptor by name in the proto file or imported files"""
+    # First check the current proto file
+    for message in proto_file.message_type:
+        if message.name == message_name:
+            return message
+    
+    # If not found and we have all proto files, search in imports
+    if all_proto_files:
+        for imported_file in all_proto_files:
+            for message in imported_file.message_type:
+                if message.name == message_name:
+                    return message
+    
+    return None
+
+def find_message_proto_module(message_name: str, proto_file: FileDescriptorProto, all_proto_files: Optional[List[FileDescriptorProto]] = None) -> str:
+    """Find which proto module contains a message type and return the module name"""
+    # First check the current proto file
+    for message in proto_file.message_type:
+        if message.name == message_name:
+            return proto_file.name.replace('.proto', '').split('/')[-1] + '_pb2'
+    
+    # If not found and we have all proto files, search in imports
+    if all_proto_files:
+        for imported_file in all_proto_files:
+            for message in imported_file.message_type:
+                if message.name == message_name:
+                    # TODO: double check assumption of paths - 
+                    #   will importing proto files in another package / directory work?
+                    return imported_file.name.replace('.proto', '').split('/')[-1] + '_pb2'
+    
+    # Fallback to the main proto file if not found
+    return proto_file.name.replace('.proto', '').split('/')[-1] + '_pb2'
+
+def generate_mcp_server(service: ServiceDescriptorProto, proto_file: FileDescriptorProto, all_proto_files: Optional[List[FileDescriptorProto]] = None, mcp_port: int = 8000, grpc_port: int = 50051) -> str:
+    """Generate MCP server code for a service using FastMCP"""
+    file_name = proto_file.name
+    proto_name = file_name.replace('.proto', '').split('/')[-1]
+
+    service_metadata = {
+        'name': service.name,
+        'version': '1.0.0',
+        'description': f'{service.name} Service'
+    }
+    service_metadata = service_metadata | get_service_options(service)
+    
+    # The block below traverses the proto import tree pertaining to service.
+    # Collect all required proto modules for imports
+    required_modules = set()
+    required_modules.add(f"{proto_name}_pb2")
+    required_modules.add(f"{proto_name}_pb2_grpc")
+    
+    # Find all message types used in the service methods
+    for method in service.method:
+        input_type = method.input_type.split('.')[-1]
+        output_type = method.output_type.split('.')[-1]
+        
+        input_module = find_message_proto_module(input_type, proto_file, all_proto_files).replace('_pb2', '')
+        output_module = find_message_proto_module(output_type, proto_file, all_proto_files).replace('_pb2', '')
+        
+        required_modules.add(f"{input_module}_pb2")
+        required_modules.add(f"{output_module}_pb2")
+    
+    # Generate imports
+    import_lines = []
+    for module in sorted(required_modules):
+        import_lines.append(f"import {module}")
+    
+    server_code = f'''#!/usr/bin/env python3
+"""
+MCP server implementation for {service.name} using FastMCP
+"""
+import grpc
+from concurrent import futures
+{chr(10).join(import_lines)}
+from mcp.server.fastmcp import FastMCP
+import asyncio
+import sys
+import time
+
+# MCP Server setup using FastMCP
+mcp = FastMCP("{service_metadata['name']}", version="{service_metadata['version']}")
+
+# gRPC client setup
+channel = grpc.insecure_channel('localhost:{grpc_port}')
+stub = {proto_name}_pb2_grpc.{service.name}Stub(channel)
+
+# gRPC Service Implementation
+class {service.name}Servicer({proto_name}_pb2_grpc.{service.name}Servicer):
+    """Implementation of {service.name} service"""
+    
+'''
+    
+    # Generate gRPC method implementations
+    for method in service.method:
+        server_code += f'''    def {method.name}(self, request, context):
+        """Handle {method.name} requests"""
+        # TODO: Implement your gRPC logic here
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+    
+'''
+    
+    # Generate MCP tool definitions using FastMCP decorator
+    for method in service.method:
+        input_type = method.input_type.split('.')[-1]
+        
+        # Get method options for tool metadata
+        method_options = get_tool_options(method)
+        tool_name = method_options.get('name', f"{service.name.lower()}_{method.name.lower()}")
+        tool_description = method_options.get('description', f"Call {method.name} method")
+        
+        # Find the correct proto module for the input type
+        input_module = find_message_proto_module(input_type, proto_file, all_proto_files)
+        
+        # Generate input schema from protobuf message for function signature
+        input_schema = generate_json_schema_from_proto_type(input_type, proto_file, all_proto_files)
+        
+        # Create parameter list from schema
+        params = []
+        if 'properties' in input_schema:
+            for prop_name, prop_schema in input_schema['properties'].items():
+                prop_type = prop_schema.get('type', 'str')
+                if prop_type == 'string':
+                    params.append(f"{prop_name}: str")
+                elif prop_type == 'integer':
+                    params.append(f"{prop_name}: int")
+                elif prop_type == 'number':
+                    params.append(f"{prop_name}: float")
+                elif prop_type == 'boolean':
+                    params.append(f"{prop_name}: bool")
+                else:
+                    params.append(f"{prop_name}: str")
+        
+        param_str = ", ".join(params) if params else ""
+        
+        # Generate parameter dict for protobuf call
+        param_dict = "{" + ", ".join([f'"{p.split(":")[0].strip()}": {p.split(":")[0].strip()}' for p in params]) + "}" if params else "{}"
+        
+        # Get output type information
+        output_type = method.output_type.split('.')[-1]
+        output_module = find_message_proto_module(output_type, proto_file, all_proto_files)
+        output_schema = generate_json_schema_from_proto_type(output_type, proto_file, all_proto_files)
+        
+        server_code += f'''# MCP tool definition using FastMCP decorator
+@mcp.tool()
+def {tool_name}({param_str}) -> dict:
+    """{tool_description}"""
+    try:
+        # Convert arguments to protobuf message
+        pb_request = {input_module}.{input_type}(**{param_dict})
+        # Call gRPC method
+        response = stub.{method.name}(pb_request)
+        # Convert protobuf response to JSON payload matching output schema
+        result = {{}}
+        for field_name in {list(output_schema.get('properties', {}).keys())}:
+            if hasattr(response, field_name):
+                result[field_name] = getattr(response, field_name)
+        return result
+    except grpc.RpcError as e:
+        error_msg = f"gRPC error: {{e.details() if hasattr(e, 'details') else str(e)}}"
+        return {{"error": True, "error_message": error_msg}}
+    except Exception as e:
+        error_msg = f"Error calling tool: {{str(e)}}"
+        return {{"error": True, "error_message": error_msg}}
+
+'''
+    
+    server_code += f'''def serve_grpc():
+    """Start the gRPC server"""
+    server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))
+    {proto_name}_pb2_grpc.add_{service.name}Servicer_to_server(
+        {service.name}Servicer(), server
+    )
+    
+    listen_addr = 'localhost:{grpc_port}'
+    server.add_insecure_port(listen_addr)
+    
+    print(f"Starting gRPC server on {{listen_addr}}", file=sys.stderr)
+    server.start()
+    return server
+
+def main():
+    """Main function"""
+    # Start gRPC server in a separate thread
+    grpc_server = serve_grpc()
+    
+    # Give the gRPC server time to start
+    time.sleep(1)
+    
+    try:
+        # Start MCP server using stdio transport
+        print("Starting MCP server...", file=sys.stderr)
+        mcp.run(transport="stdio")
+    except KeyboardInterrupt:
+        print("Shutting down...", file=sys.stderr)
+    finally:
+        # Clean up gRPC server
+        grpc_server.stop(0)
+
+if __name__ == '__main__':
+    main()
+'''
+    
+    return server_code
+
+
+def generate_code(request: plugin_pb2.CodeGeneratorRequest, response: plugin_pb2.CodeGeneratorResponse) -> None:
+    """Generate code based on the generation mode."""
+    # Parse parameters from protoc request
+    generate_mcp, generate_server, mcp_port, grpc_port = parse_protoc_parameters(request.parameter)
+    
+    for proto_file in request.proto_file:
+        # Skip files that don't have services
+        if not proto_file.service:
+            continue
+            
+        # Generate MCP manifest if requested
+        if generate_mcp:
+            manifest = generate_mcp_manifest(proto_file, list(request.proto_file))
+            if manifest:
+                output_filename = f"{proto_file.name}.mcp.json"
+                output_file = response.file.add()
+                output_file.name = output_filename
+                output_file.content = json.dumps(manifest, indent=2)
+        
+        # Generate Python server code if requested
+        if generate_server:
+            for service in proto_file.service:
+                server_code = generate_mcp_server(service, proto_file, list(request.proto_file), mcp_port, grpc_port)
+                file_name = f"{proto_file.name.replace('.proto', '')}_{service.name.lower()}_mcp_server.py"
+                
+                output_file = response.file.add()
+                output_file.name = file_name
+                output_file.content = server_code
+
+def parse_protoc_parameters(parameter: str) -> tuple[bool, bool, int, int]:
+    """Parse parameters from protoc request
+    
+    Args:
+        parameter: The parameter string from protoc
+        
+    Returns:
+        tuple: (generate_mcp, generate_server, mcp_port, grpc_port)
+    """
+    # TODO: Clean this up, quad-tuple return values smell.
+    mcp_port = 8000  # Default port
+    grpc_port = 50051  # Default port
+    
+    if not parameter:
+        # Default: generate both
+        return True, True, mcp_port, grpc_port
+    
+    # Split parameter string into individual arguments
+    args = parameter.split(',') if parameter else []
+    
+    generate_mcp_only = '--generate-mcp-only' in args
+    generate_server_only = '--generate-server-only' in args
+    
+    # Look for port parameters
+    for arg in args:
+        if arg.startswith('--mcp_port='):
+            try:
+                mcp_port = int(arg.split('=')[1])
+            except (ValueError, IndexError):
+                # Keep default port if parsing fails
+                pass
+        elif arg.startswith('--grpc_port='):
+            try:
+                grpc_port = int(arg.split('=')[1])
+            except (ValueError, IndexError):
+                # Keep default port if parsing fails
+                pass
+    
+    if generate_mcp_only and generate_server_only:
+        # If both flags are set, generate both (user error, but be permissive)
+        return True, True, mcp_port, grpc_port
+    elif generate_mcp_only:
+        return True, False, mcp_port, grpc_port
+    elif generate_server_only:
+        return False, True, mcp_port, grpc_port
+    else:
+        # Default: generate both
+        return True, True, mcp_port, grpc_port
+
+def main():
+    """Main plugin function"""
+    # Read request message from stdin
+    request_data = sys.stdin.buffer.read()
+    
+    # Parse request
+    request = plugin_pb2.CodeGeneratorRequest()
+    request.ParseFromString(request_data)
+    
+    # Create response
+    response = plugin_pb2.CodeGeneratorResponse()
+    
+    try:
+        # Generate code
+        generate_code(request, response)
+    except Exception as e:
+        error_message = f"Error generating code: {str(e)}"
+        response.error = error_message
+        print(error_message, file=sys.stderr)
+    
+    # Serialize response message
+    output = response.SerializeToString()
+    
+    # Write response to stdout
+    sys.stdout.buffer.write(output)
+
+if __name__ == '__main__':
+    main()
