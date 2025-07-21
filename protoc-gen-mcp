@@ -5,8 +5,12 @@ Unified protobuf code generator that generates:
 - An accompanying MCP manifest, so that an LLM can use the MCP proxy.
 """
 
+import argparse
 import json
+import shlex
 import sys
+import warnings
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 from google.protobuf.compiler import plugin_pb2
 from google.protobuf.descriptor_pb2 import FileDescriptorProto, ServiceDescriptorProto, MethodDescriptorProto, DescriptorProto, FieldDescriptorProto
@@ -51,7 +55,7 @@ def get_tool_options(method: MethodDescriptorProto) -> Dict[str, Any]:
             method_info['description'] = method_options.Extensions[mcp_options_pb2.mcp_tool_description]
     
     except Exception as e:
-        print(f"Warning: Could not extract method options: {str(e)}", file=sys.stderr)
+        warnings.warn(f"Could not extract method options: {str(e)}", UserWarning)
     
     return method_info
 
@@ -65,7 +69,7 @@ def get_field_options(field) -> Dict[str, Any]:
             if field_options.HasExtension(mcp_options_pb2.field_required):
                 field_info['required'] = field_options.Extensions[mcp_options_pb2.field_required]
     except Exception as e:
-        print(f"Warning: Could not extract field options: {str(e)}", file=sys.stderr)
+        warnings.warn(f"Could not extract field options: {str(e)}", UserWarning)
     
     return field_info
 
@@ -526,7 +530,8 @@ if __name__ == '__main__':
 def generate_code(request: plugin_pb2.CodeGeneratorRequest, response: plugin_pb2.CodeGeneratorResponse) -> None:
     """Generate code based on the generation mode."""
     # Parse parameters from protoc request
-    generate_mcp, generate_server, mcp_port, grpc_port = parse_protoc_parameters(request.parameter)
+    generation_config = parse_generation_flags(request.parameter)
+    port_config = parse_port_config(request.parameter)
     
     for proto_file in request.proto_file:
         # Skip files that don't have services
@@ -534,7 +539,7 @@ def generate_code(request: plugin_pb2.CodeGeneratorRequest, response: plugin_pb2
             continue
             
         # Generate MCP manifest if requested
-        if generate_mcp:
+        if generation_config.generate_mcp:
             manifest = generate_mcp_manifest(proto_file, list(request.proto_file))
             if manifest:
                 output_filename = f"{proto_file.name}.mcp.json"
@@ -543,63 +548,114 @@ def generate_code(request: plugin_pb2.CodeGeneratorRequest, response: plugin_pb2
                 output_file.content = json.dumps(manifest, indent=2)
         
         # Generate Python server code if requested
-        if generate_server:
+        if generation_config.generate_server:
             for service in proto_file.service:
-                server_code = generate_mcp_server(service, proto_file, list(request.proto_file), mcp_port, grpc_port)
+                server_code = generate_mcp_server(service, proto_file, list(request.proto_file), port_config.mcp_port, port_config.grpc_port)
                 file_name = f"{proto_file.name.replace('.proto', '')}_{service.name.lower()}_mcp_server.py"
                 
                 output_file = response.file.add()
                 output_file.name = file_name
                 output_file.content = server_code
 
-def parse_protoc_parameters(parameter: str) -> tuple[bool, bool, int, int]:
-    """Parse parameters from protoc request
+@dataclass
+class GenerationConfig:
+    """Configuration for what to generate"""
+    generate_mcp: bool = True
+    generate_server: bool = True
+
+@dataclass  
+class PortConfig:
+    """Configuration for server ports"""
+    mcp_port: int = 8000
+    grpc_port: int = 50051
+
+def parse_generation_flags(parameter: str) -> GenerationConfig:
+    """Parse generation flags from protoc parameters
     
     Args:
         parameter: The parameter string from protoc
         
     Returns:
-        tuple: (generate_mcp, generate_server, mcp_port, grpc_port)
+        GenerationConfig: Configuration for what to generate
     """
-    # TODO: Clean this up, quad-tuple return values smell.
-    mcp_port = 8000  # Default port
-    grpc_port = 50051  # Default port
+    if not parameter:
+        return GenerationConfig()
+    
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument('--generate-manifest-only', action='store_true',
+                       help='Generate only MCP manifest')
+    parser.add_argument('--generate-server-only', action='store_true', 
+                       help='Generate only server code')
+    
+    try:
+        args_list = _parse_parameter_string(parameter)
+        parsed_args, _ = parser.parse_known_args(args_list)
+        
+        # Determine what to generate
+        if parsed_args.generate_manifest_only and parsed_args.generate_server_only:
+            warnings.warn("--generate-server-only and --generate-manifest-only are set simultaneously. Generating both.", UserWarning)
+            return GenerationConfig(generate_mcp=True, generate_server=True)
+        elif parsed_args.generate_manifest_only:
+            return GenerationConfig(generate_mcp=True, generate_server=False)
+        elif parsed_args.generate_server_only:
+            return GenerationConfig(generate_mcp=False, generate_server=True)
+        else:
+            # Default: generate both
+            return GenerationConfig(generate_mcp=True, generate_server=True)
+            
+    except (argparse.ArgumentError, SystemExit):
+        warnings.warn(f"Could not parse generation flags from '{parameter}', using defaults", UserWarning)
+        return GenerationConfig()
+
+def parse_port_config(parameter: str) -> PortConfig:
+    """Parse port configuration from protoc parameters
+    
+    Args:
+        parameter: The parameter string from protoc
+        
+    Returns:
+        PortConfig: Configuration for server ports
+    """
+    config = PortConfig()
     
     if not parameter:
-        # Default: generate both
-        return True, True, mcp_port, grpc_port
+        return config
     
-    # Split parameter string into individual arguments
-    args = parameter.split(',') if parameter else []
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument('--mcp_port', type=int, default=config.mcp_port,
+                       help='Port for MCP server (default: 8000)')
+    parser.add_argument('--grpc_port', type=int, default=config.grpc_port,
+                       help='Port for gRPC server (default: 50051)')
     
-    generate_mcp_only = '--generate-mcp-only' in args
-    generate_server_only = '--generate-server-only' in args
+    try:
+        args_list = _parse_parameter_string(parameter)
+        parsed_args, _ = parser.parse_known_args(args_list)
+        return PortConfig(mcp_port=parsed_args.mcp_port, grpc_port=parsed_args.grpc_port)
+        
+    except (argparse.ArgumentError, SystemExit):
+        warnings.warn(f"Could not parse port config from '{parameter}', using defaults", UserWarning)
+        return config
+
+def _parse_parameter_string(parameter: str) -> list[str]:
+    """Parse parameter string into argument list, handling both shell-style and comma-separated formats
     
-    # Look for port parameters
-    for arg in args:
-        if arg.startswith('--mcp_port='):
-            try:
-                mcp_port = int(arg.split('=')[1])
-            except (ValueError, IndexError):
-                # Keep default port if parsing fails
-                pass
-        elif arg.startswith('--grpc_port='):
-            try:
-                grpc_port = int(arg.split('=')[1])
-            except (ValueError, IndexError):
-                # Keep default port if parsing fails
-                pass
+    Args:
+        parameter: The parameter string from protoc
+        
+    Returns:
+        list[str]: List of parsed arguments
+    """
+    try:
+        args_list = shlex.split(parameter)
+    except ValueError:
+        # Fall back to comma-separated parsing if shlex fails
+        args_list = [arg.strip() for arg in parameter.split(',') if arg.strip()]
     
-    if generate_mcp_only and generate_server_only:
-        # If both flags are set, generate both (user error, but be permissive)
-        return True, True, mcp_port, grpc_port
-    elif generate_mcp_only:
-        return True, False, mcp_port, grpc_port
-    elif generate_server_only:
-        return False, True, mcp_port, grpc_port
-    else:
-        # Default: generate both
-        return True, True, mcp_port, grpc_port
+    # If shlex.split didn't split anything and we have commas, try comma-separated
+    if len(args_list) == 1 and ',' in parameter:
+        args_list = [arg.strip() for arg in parameter.split(',') if arg.strip()]
+    
+    return args_list
 
 def main():
     """Main plugin function"""

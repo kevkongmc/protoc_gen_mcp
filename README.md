@@ -78,7 +78,7 @@ python -m grpc_tools.protoc --proto_path=venv/lib/python3.13/site-packages --pro
 
 **Generate MCP manifest only:**
 ```bash
-python -m grpc_tools.protoc --proto_path=venv/lib/python3.13/site-packages --proto_path=. --python_out=. --grpc_python_out=. --plugin=protoc-gen-mcp=protoc-gen-mcp --mcp_out=--generate-mcp-only:. helloworld/hello_service.proto
+python -m grpc_tools.protoc --proto_path=venv/lib/python3.13/site-packages --proto_path=. --python_out=. --grpc_python_out=. --plugin=protoc-gen-mcp=protoc-gen-mcp --mcp_out=--generate-manifest-only:. helloworld/hello_service.proto
 ```
 
 **Configure custom ports:**
