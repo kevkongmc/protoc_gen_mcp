@@ -9,10 +9,9 @@ import json
 import sys
 from typing import Any, Dict, List, Optional
 from google.protobuf.compiler import plugin_pb2
-from google.protobuf.descriptor_pb2 import FileDescriptorProto, ServiceDescriptorProto, MethodDescriptorProto, DescriptorProto
+from google.protobuf.descriptor_pb2 import FileDescriptorProto, ServiceDescriptorProto, MethodDescriptorProto, DescriptorProto, FieldDescriptorProto
 
 from mcpoptions import mcp_options_pb2
-from google.api import annotations_pb2
 
 MCP_VERSION = "2024-11-05"
 
@@ -70,28 +69,28 @@ def get_field_options(field) -> Dict[str, Any]:
     
     return field_info
 
-def generate_json_schema_from_proto_message(message_desc: DescriptorProto) -> Dict[str, Any]:
+def generate_json_schema_from_proto_message(message_desc: DescriptorProto, parent_message: Optional[DescriptorProto] = None) -> Dict[str, Any]:
     """Generate JSON schema for a protobuf message descriptor."""
     # Map protobuf field types to JSON schema types
     type_mapping = {
-        1: "number",       # TYPE_DOUBLE
-        2: "number",       # TYPE_FLOAT
-        3: "integer",      # TYPE_INT64
-        4: "integer",      # TYPE_UINT64
-        5: "integer",      # TYPE_INT32
-        6: "integer",      # TYPE_FIXED64
-        7: "integer",      # TYPE_FIXED32
-        8: "boolean",      # TYPE_BOOL
-        9: "string",       # TYPE_STRING
-        10: "object",      # TYPE_GROUP (deprecated)
-        11: "object",      # TYPE_MESSAGE
-        12: "string",      # TYPE_BYTES (base64 encoded)
-        13: "integer",     # TYPE_UINT32
-        14: "integer",     # TYPE_ENUM
-        15: "integer",     # TYPE_SFIXED32
-        16: "integer",     # TYPE_SFIXED64
-        17: "integer",     # TYPE_SINT32
-        18: "integer",     # TYPE_SINT64
+        FieldDescriptorProto.TYPE_DOUBLE: "number",
+        FieldDescriptorProto.TYPE_FLOAT: "number",
+        FieldDescriptorProto.TYPE_INT64: "integer",
+        FieldDescriptorProto.TYPE_UINT64: "integer",
+        FieldDescriptorProto.TYPE_INT32: "integer",
+        FieldDescriptorProto.TYPE_FIXED64: "integer",
+        FieldDescriptorProto.TYPE_FIXED32: "integer",
+        FieldDescriptorProto.TYPE_BOOL: "boolean",
+        FieldDescriptorProto.TYPE_STRING: "string",
+        FieldDescriptorProto.TYPE_GROUP: "object",      # (deprecated)
+        FieldDescriptorProto.TYPE_MESSAGE: "object",
+        FieldDescriptorProto.TYPE_BYTES: "string",      # (base64 encoded)
+        FieldDescriptorProto.TYPE_UINT32: "integer",
+        FieldDescriptorProto.TYPE_ENUM: "integer",
+        FieldDescriptorProto.TYPE_SFIXED32: "integer",
+        FieldDescriptorProto.TYPE_SFIXED64: "integer",
+        FieldDescriptorProto.TYPE_SINT32: "integer",
+        FieldDescriptorProto.TYPE_SINT64: "integer",
     }
     
     properties = {}
@@ -99,18 +98,59 @@ def generate_json_schema_from_proto_message(message_desc: DescriptorProto) -> Di
     
     for field in message_desc.field:
         field_name = field.name
-        json_type = type_mapping.get(field.type, "string")
+        field_schema = None
         
-        # Handle repeated fields
-        if field.label == 3:  # LABEL_REPEATED
-            field_schema = {
-                "type": "array",
-                "items": {"type": json_type}
-            }
+        # Handle MESSAGE types (nested messages)
+        if field.type == FieldDescriptorProto.TYPE_MESSAGE:
+            # Find the nested message type
+            nested_message = None
+            type_name = field.type_name
+            
+            # Remove leading dot if present
+            if type_name.startswith('.'):
+                type_name = type_name[1:]
+            
+            # Extract the message name (last part after dots)
+            message_name = type_name.split('.')[-1]
+            
+            # First check nested types within the current message
+            for nested_type in message_desc.nested_type:
+                if nested_type.name == message_name:
+                    nested_message = nested_type
+                    break
+            
+            # If not found in current message and we have a parent, check parent's nested types
+            if not nested_message and parent_message:
+                for nested_type in parent_message.nested_type:
+                    if nested_type.name == message_name:
+                        nested_message = nested_type
+                        break
+            
+            if nested_message:
+                # Recursively generate schema for nested message
+                nested_schema = generate_json_schema_from_proto_message(nested_message, message_desc)
+            else:
+                # Fallback for unknown message types
+                nested_schema = {"type": "object"}
+            
+            if field.label == FieldDescriptorProto.LABEL_REPEATED:
+                field_schema = {
+                    "type": "array",
+                    "items": nested_schema
+                }
+            else:
+                field_schema = nested_schema
         else:
-            field_schema = {"type": json_type}
-        
-        # TODO: Handle nested fields (proto in proto)
+            # Handle primitive types
+            json_type = type_mapping.get(field.type, "string")
+            
+            if field.label == 3:  # LABEL_REPEATED
+                field_schema = {
+                    "type": "array",
+                    "items": {"type": json_type}
+                }
+            else:
+                field_schema = {"type": json_type}
             
         # Check if field is marked as required via MCP options
         field_options = get_field_options(field)
@@ -225,10 +265,26 @@ def generate_mcp_manifest(proto_file: FileDescriptorProto, all_proto_files: Opti
 
 def find_message_by_name(proto_file: FileDescriptorProto, message_name: str, all_proto_files: Optional[List[FileDescriptorProto]] = None) -> Optional[DescriptorProto]:
     """Find a message descriptor by name in the proto file or imported files"""
+    
+    def search_nested_messages(message_desc: DescriptorProto, target_name: str) -> Optional[DescriptorProto]:
+        """Recursively search for nested messages within a message descriptor"""
+        for nested_message in message_desc.nested_type:
+            if nested_message.name == target_name:
+                return nested_message
+            # Recursively search within nested messages
+            found = search_nested_messages(nested_message, target_name)
+            if found:
+                return found
+        return None
+    
     # First check the current proto file
     for message in proto_file.message_type:
         if message.name == message_name:
             return message
+        # Also search nested messages
+        nested_found = search_nested_messages(message, message_name)
+        if nested_found:
+            return nested_found
     
     # If not found and we have all proto files, search in imports
     if all_proto_files:
@@ -236,14 +292,32 @@ def find_message_by_name(proto_file: FileDescriptorProto, message_name: str, all
             for message in imported_file.message_type:
                 if message.name == message_name:
                     return message
+                # Also search nested messages in imported files
+                nested_found = search_nested_messages(message, message_name)
+                if nested_found:
+                    return nested_found
     
     return None
 
 def find_message_proto_module(message_name: str, proto_file: FileDescriptorProto, all_proto_files: Optional[List[FileDescriptorProto]] = None) -> str:
     """Find which proto module contains a message type and return the module name"""
+    
+    def search_nested_messages(message_desc: DescriptorProto, target_name: str) -> bool:
+        """Recursively search for nested messages within a message descriptor"""
+        for nested_message in message_desc.nested_type:
+            if nested_message.name == target_name:
+                return True
+            # Recursively search within nested messages
+            if search_nested_messages(nested_message, target_name):
+                return True
+        return False
+    
     # First check the current proto file
     for message in proto_file.message_type:
         if message.name == message_name:
+            return proto_file.name.replace('.proto', '').split('/')[-1] + '_pb2'
+        # Also search nested messages
+        if search_nested_messages(message, message_name):
             return proto_file.name.replace('.proto', '').split('/')[-1] + '_pb2'
     
     # If not found and we have all proto files, search in imports
@@ -253,6 +327,9 @@ def find_message_proto_module(message_name: str, proto_file: FileDescriptorProto
                 if message.name == message_name:
                     # TODO: double check assumption of paths - 
                     #   will importing proto files in another package / directory work?
+                    return imported_file.name.replace('.proto', '').split('/')[-1] + '_pb2'
+                # Also search nested messages in imported files
+                if search_nested_messages(message, message_name):
                     return imported_file.name.replace('.proto', '').split('/')[-1] + '_pb2'
     
     # Fallback to the main proto file if not found
@@ -356,13 +433,27 @@ class {service.name}Servicer({proto_name}_pb2_grpc.{service.name}Servicer):
                     params.append(f"{prop_name}: float")
                 elif prop_type == 'boolean':
                     params.append(f"{prop_name}: bool")
+                elif prop_type == 'object':
+                    params.append(f"{prop_name}: dict")
+                elif prop_type == 'array':
+                    params.append(f"{prop_name}: list")
                 else:
                     params.append(f"{prop_name}: str")
         
         param_str = ", ".join(params) if params else ""
         
-        # Generate parameter dict for protobuf call
-        param_dict = "{" + ", ".join([f'"{p.split(":")[0].strip()}": {p.split(":")[0].strip()}' for p in params]) + "}" if params else "{}"
+        # Generate protobuf message construction code that handles nested objects
+        construction_lines = []
+        if 'properties' in input_schema:
+            for prop_name, prop_schema in input_schema['properties'].items():
+                prop_type = prop_schema.get('type', 'str')
+                if prop_type == 'object':
+                    # Handle nested message objects - assume nested message name is capitalized prop name
+                    construction_lines.append(f'"{prop_name}": {input_module}.{input_type}.{prop_name.title()}(**{prop_name}) if {prop_name} else None')
+                else:
+                    construction_lines.append(f'"{prop_name}": {prop_name}')
+        
+        param_dict = "{" + ", ".join(construction_lines) + "}" if construction_lines else "{}"
         
         # Get output type information
         output_type = method.output_type.split('.')[-1]

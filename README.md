@@ -13,7 +13,6 @@ Some feature gaps have been documented here (see TODO below and in code), and I'
 ## TODO
 - Support standalone MCP server generation, allowing the generated server to point to an existing gRPC server implementation.
 - Support MCP server generation using the gRPC reflection endpoint, allowing the generated server to generate based on a running gRPC server, as opposed to a `proto` definition file.
-- Support nested proto definitions when generating the JSON schema.
 
 ## Setup
 
@@ -50,20 +49,24 @@ python -m grpc_tools.protoc --proto_path=venv/lib/python3.13/site-packages --pro
 
 ## Example Implementation for e2e Testing
 
-Add this implementation to `helloworld/hello_service_greeter_mcp_server.py` (on line 30):
+Add this implementation to `helloworld/hello_service_greeter_mcp_server.py` (on line 26):
 ```python
 def SayHello(self, request, context):
     """Handle SayHello requests"""
-    return hello_messages_pb2.HelloReply(message=f"Hello {request.name}! TEST_MARKER_SUCCESS")
+    names_greeting = request.person.name
+        if request.person.names:
+            names_greeting += " aka. "
+            names_greeting += ", ".join(request.person.names)
+        return hello_messages_pb2.HelloReply(message=f"Hello {names_greeting}! TEST_MARKER_SUCCESS")
 ```
 
 The end to end test can then be run with
 ```bash
-# Run end-to-end integration test (requires Ollama, will download llama3.2:3b if not downloaded.)
+# Run end-to-end integration test (requires Ollama, will download qwen2.5:latest if not downloaded.)
 python -m pytest mcp_integration_test.py -v -s
 
-# Run with a different model (e.g., qwen2.5:latest)
-OLLAMA_MODEL=qwen2.5:latest python -m pytest mcp_integration_test.py -v -s
+# Run with a different model (e.g., llama3.2:3b)
+OLLAMA_MODEL=llama3.2:3b python -m pytest mcp_integration_test.py -v -s
 ```
 
 ## Optional Flags

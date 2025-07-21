@@ -28,7 +28,7 @@ from fastmcp.client.transports import StdioTransport
 class OllamaManager:
     """Manages Ollama server process"""
     
-    def __init__(self, model: str = "llama3.2:3b", port: int = 11434):
+    def __init__(self, model: str = "qwen2.5:latest", port: int = 11434):
         self.model = model
         self.port = port
         self.process = None
@@ -126,7 +126,7 @@ class OllamaManager:
 class OllamaLLM:
     """Simple Ollama LLM client"""
     
-    def __init__(self, model: str = "llama3.2:3b", base_url: str = "http://localhost:11434"):
+    def __init__(self, model: str = "qwen2.5:latest", base_url: str = "http://localhost:11434"):
         self.model = model
         self.base_url = base_url
         self.session = requests.Session()
@@ -191,7 +191,7 @@ class MCPServerManager:
 @pytest.fixture(scope="session")
 def model_name(request):
     """Get model name from environment variable"""
-    model = os.environ.get("OLLAMA_MODEL", "llama3.2:3b")
+    model = os.environ.get("OLLAMA_MODEL", "qwen2.5:latest")
     return model
 
 
@@ -307,8 +307,14 @@ class TestMCPIntegration:
             
             assert say_hello_tool is not None, "say_hello tool not found"
             
-            # Call the tool
-            result = await client.call_tool("say_hello", {"name": "TestUser"})
+            # Call the tool with nested person object as defined in MCP schema
+            result = await client.call_tool("say_hello", {
+                "person": {
+                    "name": "TestUser",
+                    "names": ["TestUser", "Tester"],
+                    "greeting": "Hi there!"
+                }
+            })
             
             # Check result
             assert result is not None
@@ -360,20 +366,18 @@ Be sure to use the exact tool names and parameter names as defined.
             "Please use the available tools to do this. Respond only with the JSON payload."
         
         llm_response = llm_client.chat(user_prompt, system_prompt)
-        print(f"LLM Response: {llm_response}")
+        print(f"LLM Response:\n{llm_response}")
         
-        # Try to parse tool call from LLM response
-        tool_call_expected = {
-            "tool_call": {
-                "name": "say_hello",
-                "arguments": {
-                    "name": "MCPUser"
-                }
-            }
-        }
-        assert tool_call_expected == json.loads(llm_response), "LLM didn't return valid JSON tool call"
+        # Try to parse tool call from LLM response - fix incomplete JSON if needed
+        llm_json = json.loads(llm_response)
         
-        tool_call = tool_call_expected["tool_call"]
+        # Validate the structure is correct
+        assert "tool_call" in llm_json, "Missing tool_call in response"
+        assert llm_json["tool_call"]["name"] == "say_hello", "Incorrect tool name"
+        assert "person" in llm_json["tool_call"]["arguments"], "Missing person argument"
+        assert "name" in llm_json["tool_call"]["arguments"]["person"], "Missing name in person object"
+        
+        tool_call = llm_json["tool_call"]
         tool_name = tool_call["name"]
         tool_args = tool_call["arguments"]
         

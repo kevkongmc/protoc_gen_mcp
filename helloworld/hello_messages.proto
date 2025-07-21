@@ -6,7 +6,12 @@ import "mcpoptions/mcp_options.proto";
 
 // The request message containing the user's name
 message HelloRequest {
-  string name = 1 [(mcp.field_required) = true];
+  message Person {
+    string name = 1 [(mcp.field_required) = true];
+    repeated string names = 2;
+    string greeting = 3 [(mcp.field_required) = false];
+  }
+  Person person = 1 [(mcp.field_required) = true];
 }
 
 // The response message containing the greetings
