@@ -7,6 +7,7 @@ Unified protobuf code generator that generates:
 
 import argparse
 import json
+import os
 import shlex
 import sys
 import warnings
@@ -14,6 +15,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 from google.protobuf.compiler import plugin_pb2
 from google.protobuf.descriptor_pb2 import FileDescriptorProto, ServiceDescriptorProto, MethodDescriptorProto, DescriptorProto, FieldDescriptorProto
+from jinja2 import Environment, FileSystemLoader
 
 from mcpoptions import mcp_options_pb2
 
@@ -340,7 +342,15 @@ def find_message_proto_module(message_name: str, proto_file: FileDescriptorProto
     return proto_file.name.replace('.proto', '').split('/')[-1] + '_pb2'
 
 def generate_mcp_server(service: ServiceDescriptorProto, proto_file: FileDescriptorProto, all_proto_files: Optional[List[FileDescriptorProto]] = None, mcp_port: int = 8000, grpc_port: int = 50051) -> str:
-    """Generate MCP server code for a service using FastMCP"""
+    """Generate MCP server code for a service using Jinja2 templates"""
+    
+    # Set up Jinja2 environment
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    template_dir = os.path.join(script_dir, 'templates')
+    env = Environment(loader=FileSystemLoader(template_dir))
+    template = env.get_template('server.py.j2')
+    
+    # Prepare template data
     file_name = proto_file.name
     proto_name = file_name.replace('.proto', '').split('/')[-1]
 
@@ -351,7 +361,6 @@ def generate_mcp_server(service: ServiceDescriptorProto, proto_file: FileDescrip
     }
     service_metadata = service_metadata | get_service_options(service)
     
-    # The block below traverses the proto import tree pertaining to service.
     # Collect all required proto modules for imports
     required_modules = set()
     required_modules.add(f"{proto_name}_pb2")
@@ -368,48 +377,8 @@ def generate_mcp_server(service: ServiceDescriptorProto, proto_file: FileDescrip
         required_modules.add(f"{input_module}_pb2")
         required_modules.add(f"{output_module}_pb2")
     
-    # Generate imports
-    import_lines = []
-    for module in sorted(required_modules):
-        import_lines.append(f"import {module}")
-    
-    server_code = f'''#!/usr/bin/env python3
-"""
-MCP server implementation for {service.name} using FastMCP
-"""
-import grpc
-from concurrent import futures
-{chr(10).join(import_lines)}
-from mcp.server.fastmcp import FastMCP
-import asyncio
-import sys
-import time
-
-# MCP Server setup using FastMCP
-mcp = FastMCP("{service_metadata['name']}", version="{service_metadata['version']}")
-
-# gRPC client setup
-channel = grpc.insecure_channel('localhost:{grpc_port}')
-stub = {proto_name}_pb2_grpc.{service.name}Stub(channel)
-
-# gRPC Service Implementation
-class {service.name}Servicer({proto_name}_pb2_grpc.{service.name}Servicer):
-    """Implementation of {service.name} service"""
-    
-'''
-    
-    # Generate gRPC method implementations
-    for method in service.method:
-        server_code += f'''    def {method.name}(self, request, context):
-        """Handle {method.name} requests"""
-        # TODO: Implement your gRPC logic here
-        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
-        context.set_details('Method not implemented!')
-        raise NotImplementedError('Method not implemented!')
-    
-'''
-    
-    # Generate MCP tool definitions using FastMCP decorator
+    # Prepare tool data for each method
+    tools = []
     for method in service.method:
         input_type = method.input_type.split('.')[-1]
         
@@ -461,70 +430,31 @@ class {service.name}Servicer({proto_name}_pb2_grpc.{service.name}Servicer):
         
         # Get output type information
         output_type = method.output_type.split('.')[-1]
-        output_module = find_message_proto_module(output_type, proto_file, all_proto_files)
         output_schema = generate_json_schema_from_proto_type(output_type, proto_file, all_proto_files)
+        output_fields = list(output_schema.get('properties', {}).keys())
         
-        server_code += f'''# MCP tool definition using FastMCP decorator
-@mcp.tool()
-def {tool_name}({param_str}) -> dict:
-    """{tool_description}"""
-    try:
-        # Convert arguments to protobuf message
-        pb_request = {input_module}.{input_type}(**{param_dict})
-        # Call gRPC method
-        response = stub.{method.name}(pb_request)
-        # Convert protobuf response to JSON payload matching output schema
-        result = {{}}
-        for field_name in {list(output_schema.get('properties', {}).keys())}:
-            if hasattr(response, field_name):
-                result[field_name] = getattr(response, field_name)
-        return result
-    except grpc.RpcError as e:
-        error_msg = f"gRPC error: {{e.details() if hasattr(e, 'details') else str(e)}}"
-        return {{"error": True, "error_message": error_msg}}
-    except Exception as e:
-        error_msg = f"Error calling tool: {{str(e)}}"
-        return {{"error": True, "error_message": error_msg}}
-
-'''
+        # Create tool data
+        tool_data = {
+            'name': tool_name,
+            'description': tool_description,
+            'method_name': method.name,
+            'param_str': param_str,
+            'param_dict': param_dict,
+            'input_module': input_module,
+            'input_type': input_type,
+            'output_fields': output_fields
+        }
+        tools.append(tool_data)
     
-    server_code += f'''def serve_grpc():
-    """Start the gRPC server"""
-    server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))
-    {proto_name}_pb2_grpc.add_{service.name}Servicer_to_server(
-        {service.name}Servicer(), server
+    # Render template
+    return template.render(
+        service=service,
+        service_metadata=service_metadata,
+        proto_name=proto_name,
+        required_modules=sorted(required_modules),
+        grpc_port=grpc_port,
+        tools=tools
     )
-    
-    listen_addr = 'localhost:{grpc_port}'
-    server.add_insecure_port(listen_addr)
-    
-    print(f"Starting gRPC server on {{listen_addr}}", file=sys.stderr)
-    server.start()
-    return server
-
-def main():
-    """Main function"""
-    # Start gRPC server in a separate thread
-    grpc_server = serve_grpc()
-    
-    # Give the gRPC server time to start
-    time.sleep(1)
-    
-    try:
-        # Start MCP server using stdio transport
-        print("Starting MCP server...", file=sys.stderr)
-        mcp.run(transport="stdio")
-    except KeyboardInterrupt:
-        print("Shutting down...", file=sys.stderr)
-    finally:
-        # Clean up gRPC server
-        grpc_server.stop(0)
-
-if __name__ == '__main__':
-    main()
-'''
-    
-    return server_code
 
 
 def generate_code(request: plugin_pb2.CodeGeneratorRequest, response: plugin_pb2.CodeGeneratorResponse) -> None:
