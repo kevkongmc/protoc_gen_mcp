@@ -1,0 +1,49 @@
+#!/usr/bin/env python3
+"""
+Standalone gRPC server implementation for {{ service.name }}
+"""
+import grpc
+from concurrent import futures
+{%- for module in required_modules %}
+import {{ module }}
+{%- endfor %}
+import sys
+
+class {{ service.name }}Servicer({{ proto_name }}_pb2_grpc.{{ service.name }}Servicer):
+    """Implementation of {{ service.name }} service"""
+    
+{%- for method in service.method %}
+    def {{ method.name }}(self, request, context):
+        """Handle {{ method.name }} requests"""
+        # TODO: Implement your gRPC logic here
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+    
+{%- endfor %}
+
+def serve():
+    """Start the gRPC server"""
+    server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))
+    {{ proto_name }}_pb2_grpc.add_{{ service.name }}Servicer_to_server(
+        {{ service.name }}Servicer(), server
+    )
+    
+    listen_addr = 'localhost:{{ grpc_port }}'
+    server.add_insecure_port(listen_addr)
+    
+    print(f"Starting gRPC server on {listen_addr}", file=sys.stderr)
+    server.start()
+    
+    try:
+        server.wait_for_termination()
+    except KeyboardInterrupt:
+        print("Shutting down gRPC server...", file=sys.stderr)
+        server.stop(0)
+
+def main():
+    """Main function"""
+    serve()
+
+if __name__ == '__main__':
+    main()

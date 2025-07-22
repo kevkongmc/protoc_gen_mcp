@@ -1,0 +1,58 @@
+#!/usr/bin/env python3
+"""
+MCP proxy server for {{ service.name }} - connects to external gRPC server
+"""
+import grpc
+{%- for module in required_modules %}
+import {{ module }}
+{%- endfor %}
+from mcp.server.fastmcp import FastMCP
+import sys
+
+# MCP Server setup using FastMCP
+mcp = FastMCP("{{ service_metadata.name }}", version="{{ service_metadata.version }}")
+
+# gRPC client setup - connects to external gRPC server
+channel = grpc.insecure_channel('localhost:{{ grpc_port }}')
+stub = {{ proto_name }}_pb2_grpc.{{ service.name }}Stub(channel)
+
+{%- for tool in tools %}
+# MCP tool definition using FastMCP decorator
+@mcp.tool()
+def {{ tool.name }}({{ tool.param_str }}) -> dict:
+    """{{ tool.description }}"""
+    try:
+        # Convert arguments to protobuf message
+        pb_request = {{ tool.input_module }}.{{ tool.input_type }}(**{{ tool.param_dict }})
+        # Call gRPC method on external server
+        response = stub.{{ tool.method_name }}(pb_request)
+        # Convert protobuf response to JSON payload matching output schema
+        result = {}
+        for field_name in {{ tool.output_fields }}:
+            if hasattr(response, field_name):
+                result[field_name] = getattr(response, field_name)
+        return result
+    except grpc.RpcError as e:
+        error_msg = f"gRPC error: {e.details() if hasattr(e, 'details') else str(e)}"
+        return {"error": True, "error_message": error_msg}
+    except Exception as e:
+        error_msg = f"Error calling tool: {str(e)}"
+        return {"error": True, "error_message": error_msg}
+
+{%- endfor %}
+
+def main():
+    """Main function - starts MCP server that proxies to gRPC server"""
+    try:
+        # Start MCP server using stdio transport
+        print("Starting MCP proxy server...", file=sys.stderr)
+        print(f"Connecting to gRPC server at localhost:{{ grpc_port }}", file=sys.stderr)
+        mcp.run(transport="stdio")
+    except KeyboardInterrupt:
+        print("Shutting down MCP proxy server...", file=sys.stderr)
+    finally:
+        # Clean up gRPC client
+        channel.close()
+
+if __name__ == '__main__':
+    main()

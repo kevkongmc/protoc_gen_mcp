@@ -11,7 +11,7 @@ Some feature gaps have been documented here (see TODO below and in code), and I'
 2. Explore whether there is a gap between the gRPC framework and AI tool usage, and whether this generator can fill that gap.
 
 ## TODO
-- Support standalone MCP server generation, allowing the generated server to point to an existing gRPC server implementation.
+- Support MCP server generation based on an existing gRPC endpoint address outside of localhost.
 - Support MCP server generation using the gRPC reflection endpoint, allowing the generated server to generate based on a running gRPC server, as opposed to a `proto` definition file.
 
 ## Setup
@@ -41,15 +41,21 @@ chmod +x protoc-gen-mcp
 
 ## Code Generation
 
-### Generate both grpc stub, MCP proxy and MCP manifest (default):
-Note: In this stage of the project, the gRPC stub and MCP proxy will be in the same file: `$(PROTO_SERVICE_FILE_NAME)_$(SERVICE_NAME)_mcp_server.py`
+### Generate the MCP server and its manifest:
+Creates only an MCP proxy that connects to external gRPC server: `$(PROTO_SERVICE_FILE_NAME)_$(SERVICE_NAME)_mcp_proxy.py`
 ```bash
-python -m grpc_tools.protoc --proto_path=venv/lib/python3.13/site-packages --proto_path=. --python_out=. --grpc_python_out=. --plugin=protoc-gen-mcp=protoc-gen-mcp --mcp_out=. helloworld/hello_service.proto
+python -m grpc_tools.protoc --proto_path=venv/lib/python3.13/site-packages --proto_path=. --python_out=. --grpc_python_out=. --plugin=protoc-gen-mcp=protoc-gen-mcp --mcp_out=--generate-mcp-proxy,--generate-manifest:. helloworld/hello_service.proto
 ```
 
 ## Example Implementation for e2e Testing
 
-Add this implementation to `helloworld/hello_service_greeter_mcp_server.py` (on line 26):
+### Generate standalone gRPC server only:
+Creates a pure testonly gRPC server implementation: `$(PROTO_SERVICE_FILE_NAME)_$(SERVICE_NAME)_grpc_server.py`
+```bash
+python -m grpc_tools.protoc --proto_path=venv/lib/python3.13/site-packages --proto_path=. --python_out=. --grpc_python_out=. --plugin=protoc-gen-mcp=protoc-gen-mcp --mcp_out=--grpc_port=9527,--generate-grpc-server:. helloworld/hello_service.proto
+```
+
+Add this implementation to `helloworld/hello_service_greeter_grpc_server.py` (on line 16):
 ```python
 def SayHello(self, request, context):
     """Handle SayHello requests"""
@@ -69,34 +75,36 @@ python -m pytest mcp_integration_test.py -v -s
 OLLAMA_MODEL=llama3.2:3b python -m pytest mcp_integration_test.py -v -s
 ```
 
-## Optional Flags
+## Optional Flags (for Code Generate)
 
-**Generate gRPC server stub and MCP proxy file only:**
+**Configure custom ports (to be run after Dependency Generation):**
 ```bash
-python -m grpc_tools.protoc --proto_path=venv/lib/python3.13/site-packages --proto_path=. --python_out=. --grpc_python_out=. --plugin=protoc-gen-mcp=protoc-gen-mcp --mcp_out=--generate-server-only:. helloworld/hello_service.proto
-```
-
-**Generate MCP manifest only:**
-```bash
-python -m grpc_tools.protoc --proto_path=venv/lib/python3.13/site-packages --proto_path=. --python_out=. --grpc_python_out=. --plugin=protoc-gen-mcp=protoc-gen-mcp --mcp_out=--generate-manifest-only:. helloworld/hello_service.proto
-```
-
-**Configure custom ports:**
-```bash
-python -m grpc_tools.protoc --proto_path=venv/lib/python3.13/site-packages --proto_path=. --python_out=. --grpc_python_out=. --plugin=protoc-gen-mcp=protoc-gen-mcp --mcp_out=--mcp_port=7788,--grpc_port=9527:. helloworld/hello_service.proto
+python -m grpc_tools.protoc --proto_path=venv/lib/python3.13/site-packages --proto_path=. --python_out=. --grpc_python_out=. --plugin=protoc-gen-mcp=protoc-gen-mcp --mcp_out=--generate-mcp-proxy,--generate-manifest,--grpc_port=9527:. helloworld/hello_service.proto
 ```
 
 ## Development:
 
-### Starting the MCP server:
+### Starting the legacy combined MCP server:
 ```bash
 PYTHONPATH=. python helloworld/hello_service_greeter_mcp_server.py
+```
+
+### Running separated servers:
+
+**Option 1: Run standalone gRPC server and MCP proxy separately**
+```bash
+# Terminal 1: Start gRPC server
+PYTHONPATH=. python helloworld/hello_service_greeter_grpc_server.py
+
+# Terminal 2: Start MCP proxy (connects to gRPC server on localhost)
+PYTHONPATH=. python helloworld/hello_service_greeter_mcp_proxy.py
 ```
 
 ### Cleanup
 To reset the working directory:
 ```bash
 find . -name "*pb2*.py" -type f -delete
-rm -f helloworld/hello_service_greeter_mcp_server.py
+rm -f helloworld/hello_service_greeter_grpc_server.py
+rm -f helloworld/hello_service_greeter_mcp_proxy.py
 rm -f helloworld/hello_service.proto.mcp.json
 ```

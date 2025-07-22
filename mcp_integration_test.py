@@ -156,31 +156,106 @@ class OllamaLLM:
             return f"Error: {str(e)}"
 
 
-class MCPServerManager:
-    """Manages the MCP server process"""
+class GRPCServerManager:
+    """Manages the gRPC server process"""
     
-    def __init__(self, script_path: str):
+    def __init__(self, script_path: str, port: int = 50051):
         self.script_path = script_path
+        self.port = port
+        self.process = None
         self.server_ready = False
         
     def start(self):
-        """Start the MCP server process"""
-        print(f"MCP server configured: {self.script_path}")
-        # MCP servers are started on-demand by the client, not as persistent processes
-        self.server_ready = True
-        print("MCP server manager ready!")
+        """Start the gRPC server process"""
+        print(f"Starting gRPC server: {self.script_path}")
         
+        env = os.environ.copy()
+        env['PYTHONPATH'] = os.path.join(os.path.dirname(__file__))
+        
+        self.process = subprocess.Popen(
+            [sys.executable, self.script_path],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+            text=True
+        )
+        
+        # Wait for server to be ready
+        self._wait_for_grpc_server()
+        print("gRPC server started successfully!")
+        
+    def _wait_for_grpc_server(self, timeout: int = 10):
+        """Wait for gRPC server to be ready"""
+        import grpc
+        import time
+        
+        start_time = time.time()
+        
+        while time.time() - start_time < timeout:
+            try:
+                # Try to connect to the gRPC server
+                channel = grpc.insecure_channel(f'localhost:{self.port}')
+                grpc.channel_ready_future(channel).result(timeout=1)
+                channel.close()
+                self.server_ready = True
+                return
+            except:
+                pass
+            time.sleep(0.5)
+        
+        # Check if process is still alive
+        if self.process and self.process.poll() is not None:
+            stdout, stderr = self.process.communicate()
+            raise RuntimeError(f"gRPC server failed to start:\nSTDOUT: {stdout}\nSTDERR: {stderr}")
+        
+        raise TimeoutError(f"gRPC server did not start within {timeout} seconds")
+    
     def stop(self):
-        """Stop the MCP server process"""
-        print("MCP server manager stopped")
-        self.server_ready = False
+        """Stop the gRPC server process"""
+        if self.process:
+            print("Stopping gRPC server...")
+            self.process.terminate()
+            try:
+                self.process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                print("Force killing gRPC server...")
+                self.process.kill()
+                self.process.wait()
+            self.process = None
+            self.server_ready = False
     
     def is_running(self) -> bool:
         """Check if server is running"""
+        return self.server_ready and self.process and self.process.poll() is None # type: ignore
+
+
+class MCPProxyManager:
+    """Manages the MCP proxy process"""
+    
+    def __init__(self, script_path: str, grpc_port: int = 50051):
+        self.script_path = script_path
+        self.grpc_port = grpc_port
+        self.server_ready = False
+        
+    def start(self):
+        """Start the MCP proxy process"""
+        print(f"MCP proxy configured: {self.script_path}")
+        print(f"Will connect to gRPC server on localhost:{self.grpc_port}")
+        # MCP proxies are started on-demand by the client, not as persistent processes
+        self.server_ready = True
+        print("MCP proxy manager ready!")
+        
+    def stop(self):
+        """Stop the MCP proxy process"""
+        print("MCP proxy manager stopped")
+        self.server_ready = False
+    
+    def is_running(self) -> bool:
+        """Check if proxy is running"""
         return self.server_ready
     
     def get_server_command(self) -> tuple[str, list[str], dict[str, str]]:
-        """Get MCP server command for client connection"""
+        """Get MCP proxy command for client connection"""
         env = os.environ.copy()
         env['PYTHONPATH'] = os.path.join(os.path.dirname(__file__))
         
@@ -205,9 +280,18 @@ def ollama_manager(model_name):
 
 
 @pytest.fixture(scope="session")
-def server_manager():
-    """Session-scoped MCP server"""
-    manager = MCPServerManager("helloworld/hello_service_greeter_mcp_server.py")
+def grpc_server_manager():
+    """Session-scoped gRPC server"""
+    manager = GRPCServerManager("helloworld/hello_service_greeter_grpc_server.py")
+    manager.start()
+    yield manager
+    manager.stop()
+
+
+@pytest.fixture(scope="session") 
+def mcp_proxy_manager(grpc_server_manager):
+    """Session-scoped MCP proxy (depends on gRPC server)"""
+    manager = MCPProxyManager("helloworld/hello_service_greeter_mcp_proxy.py")
     manager.start()
     yield manager
     manager.stop()
@@ -275,24 +359,22 @@ class TestMCPIntegration:
         print(f"LLM Analysis:\n{response}")
     
     @pytest.mark.asyncio
-    async def test_mcp_server_endpoint(self, manifest_data):
-        """Test that the MCP server endpoint works correctly"""
+    async def test_mcp_proxy_endpoint(self, manifest_data, grpc_server_manager, mcp_proxy_manager):
+        """Test that the MCP proxy endpoint works correctly with gRPC server"""
         # Verify transport is stdio
         assert manifest_data["server"]["transport"]["type"] == "stdio"
         
-        # Set up server command directly
-        env = os.environ.copy()
-        env['PYTHONPATH'] = os.path.join(os.path.dirname(__file__))
+        # Ensure gRPC server is running
+        assert grpc_server_manager.is_running(), "gRPC server is not running"
+        
+        # Set up MCP proxy command
+        command, args, env = mcp_proxy_manager.get_server_command()
         
         # Create FastMCP client with stdio transport
-        transport = StdioTransport(
-            command=sys.executable, 
-            args=["helloworld/hello_service_greeter_mcp_server.py"], 
-            env=env
-        )
+        transport = StdioTransport(command=command, args=args, env=env)
         client = Client(transport=transport)
         
-        # Test MCP server connection
+        # Test MCP proxy connection
         async with client:
             # List tools
             tools_result = await client.list_tools()
@@ -322,11 +404,11 @@ class TestMCPIntegration:
             # Check for success marker in the response
             response_text = str(result)
             assert "TEST_MARKER_SUCCESS" in response_text
-            print(f"MCP Server Response: {response_text}")
+            print(f"MCP Proxy Response: {response_text}")
     
     @pytest.mark.asyncio
-    async def test_llm_tool_calling(self, llm_client, manifest_data, server_manager):
-        """Test LLM making actual tool calls through MCP"""
+    async def test_llm_tool_calling(self, llm_client, manifest_data, grpc_server_manager, mcp_proxy_manager):
+        """Test LLM making actual tool calls through MCP proxy to gRPC server"""
         # Extract tools from manifest
         tools = manifest_data.get("tools", [])
         assert tools, "No tools found in manifest"
@@ -383,8 +465,11 @@ Be sure to use the exact tool names and parameter names as defined.
         
         print(f"LLM wants to call tool: {tool_name} with args: {tool_args}")
         
-        # Make the actual MCP tool call. This is done manually as LLMs cannot make external network calls.
-        command, args, env = server_manager.get_server_command()
+        # Ensure gRPC server is running  
+        assert grpc_server_manager.is_running(), "gRPC server is not running"
+        
+        # Make the actual MCP tool call through proxy. This is done manually as LLMs cannot make external network calls.
+        command, args, env = mcp_proxy_manager.get_server_command()
         
         # Create FastMCP client with stdio transport
         transport = StdioTransport(command=command, args=args, env=env)

@@ -341,14 +341,52 @@ def find_message_proto_module(message_name: str, proto_file: FileDescriptorProto
     # Fallback to the main proto file if not found
     return proto_file.name.replace('.proto', '').split('/')[-1] + '_pb2'
 
-def generate_mcp_server(service: ServiceDescriptorProto, proto_file: FileDescriptorProto, all_proto_files: Optional[List[FileDescriptorProto]] = None, mcp_port: int = 8000, grpc_port: int = 50051) -> str:
-    """Generate MCP server code for a service using Jinja2 templates"""
+def generate_grpc_server(service: ServiceDescriptorProto, proto_file: FileDescriptorProto, all_proto_files: Optional[List[FileDescriptorProto]] = None, grpc_port: int = 50051) -> str:
+    """Generate standalone gRPC server code for a service using Jinja2 templates"""
     
     # Set up Jinja2 environment
     script_dir = os.path.dirname(os.path.abspath(__file__))
     template_dir = os.path.join(script_dir, 'templates')
     env = Environment(loader=FileSystemLoader(template_dir))
-    template = env.get_template('server.py.j2')
+    template = env.get_template('grpc_server.py.j2')
+    
+    # Prepare template data
+    file_name = proto_file.name
+    proto_name = file_name.replace('.proto', '').split('/')[-1]
+    
+    # Collect all required proto modules for imports
+    required_modules = set()
+    required_modules.add(f"{proto_name}_pb2")
+    required_modules.add(f"{proto_name}_pb2_grpc")
+    
+    # Find all message types used in the service methods
+    for method in service.method:
+        input_type = method.input_type.split('.')[-1]
+        output_type = method.output_type.split('.')[-1]
+        
+        input_module = find_message_proto_module(input_type, proto_file, all_proto_files).replace('_pb2', '')
+        output_module = find_message_proto_module(output_type, proto_file, all_proto_files).replace('_pb2', '')
+        
+        required_modules.add(f"{input_module}_pb2")
+        required_modules.add(f"{output_module}_pb2")
+    
+    # Render template
+    return template.render(
+        service=service,
+        proto_name=proto_name,
+        required_modules=sorted(required_modules),
+        grpc_port=grpc_port
+    )
+
+
+def generate_mcp_proxy(service: ServiceDescriptorProto, proto_file: FileDescriptorProto, all_proto_files: Optional[List[FileDescriptorProto]] = None, grpc_port: int = 50051) -> str:
+    """Generate standalone MCP proxy code for a service using Jinja2 templates"""
+    
+    # Set up Jinja2 environment
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    template_dir = os.path.join(script_dir, 'templates')
+    env = Environment(loader=FileSystemLoader(template_dir))
+    template = env.get_template('mcp_proxy.py.j2')
     
     # Prepare template data
     file_name = proto_file.name
@@ -469,7 +507,7 @@ def generate_code(request: plugin_pb2.CodeGeneratorRequest, response: plugin_pb2
             continue
             
         # Generate MCP manifest if requested
-        if generation_config.generate_mcp:
+        if generation_config.generate_manifest:
             manifest = generate_mcp_manifest(proto_file, list(request.proto_file))
             if manifest:
                 output_filename = f"{proto_file.name}.mcp.json"
@@ -477,26 +515,36 @@ def generate_code(request: plugin_pb2.CodeGeneratorRequest, response: plugin_pb2
                 output_file.name = output_filename
                 output_file.content = json.dumps(manifest, indent=2)
         
-        # Generate Python server code if requested
-        if generation_config.generate_server:
+        # Generate standalone gRPC server if requested
+        if generation_config.generate_grpc_server:
             for service in proto_file.service:
-                server_code = generate_mcp_server(service, proto_file, list(request.proto_file), port_config.mcp_port, port_config.grpc_port)
-                file_name = f"{proto_file.name.replace('.proto', '')}_{service.name.lower()}_mcp_server.py"
+                server_code = generate_grpc_server(service, proto_file, list(request.proto_file), port_config.grpc_port)
+                file_name = f"{proto_file.name.replace('.proto', '')}_{service.name.lower()}_grpc_server.py"
                 
                 output_file = response.file.add()
                 output_file.name = file_name
                 output_file.content = server_code
+        
+        # Generate standalone MCP proxy if requested
+        if generation_config.generate_mcp_proxy:
+            for service in proto_file.service:
+                proxy_code = generate_mcp_proxy(service, proto_file, list(request.proto_file), port_config.grpc_port)
+                file_name = f"{proto_file.name.replace('.proto', '')}_{service.name.lower()}_mcp_proxy.py"
+                
+                output_file = response.file.add()
+                output_file.name = file_name
+                output_file.content = proxy_code
 
 @dataclass
 class GenerationConfig:
     """Configuration for what to generate"""
-    generate_mcp: bool = True
-    generate_server: bool = True
+    generate_manifest: bool = True
+    generate_grpc_server: bool = False
+    generate_mcp_proxy: bool = False
 
 @dataclass  
 class PortConfig:
     """Configuration for server ports"""
-    mcp_port: int = 8000
     grpc_port: int = 50051
 
 def parse_generation_flags(parameter: str) -> GenerationConfig:
@@ -512,30 +560,27 @@ def parse_generation_flags(parameter: str) -> GenerationConfig:
         return GenerationConfig()
     
     parser = argparse.ArgumentParser(add_help=False)
-    parser.add_argument('--generate-manifest-only', action='store_true',
+    parser.add_argument('--generate-manifest', action='store_true',
                        help='Generate only MCP manifest')
-    parser.add_argument('--generate-server-only', action='store_true', 
-                       help='Generate only server code')
+    parser.add_argument('--generate-grpc-server', action='store_true',
+                       help='Generate only standalone gRPC server')
+    parser.add_argument('--generate-mcp-proxy', action='store_true',
+                       help='Generate only standalone MCP proxy')
     
     try:
         args_list = _parse_parameter_string(parameter)
         parsed_args, _ = parser.parse_known_args(args_list)
-        
-        # Determine what to generate
-        if parsed_args.generate_manifest_only and parsed_args.generate_server_only:
-            warnings.warn("--generate-server-only and --generate-manifest-only are set simultaneously. Generating both.", UserWarning)
-            return GenerationConfig(generate_mcp=True, generate_server=True)
-        elif parsed_args.generate_manifest_only:
-            return GenerationConfig(generate_mcp=True, generate_server=False)
-        elif parsed_args.generate_server_only:
-            return GenerationConfig(generate_mcp=False, generate_server=True)
-        else:
-            # Default: generate both
-            return GenerationConfig(generate_mcp=True, generate_server=True)
+
+        return GenerationConfig(
+            generate_manifest=parsed_args.generate_manifest, 
+            generate_grpc_server=parsed_args.generate_grpc_server, 
+            generate_mcp_proxy=parsed_args.generate_mcp_proxy)
             
     except (argparse.ArgumentError, SystemExit):
-        warnings.warn(f"Could not parse generation flags from '{parameter}', using defaults", UserWarning)
-        return GenerationConfig()
+        pass
+    
+    warnings.warn(f"Could not parse generation flags from '{parameter}', using defaults", UserWarning)
+    return GenerationConfig()
 
 def parse_port_config(parameter: str) -> PortConfig:
     """Parse port configuration from protoc parameters
@@ -552,15 +597,13 @@ def parse_port_config(parameter: str) -> PortConfig:
         return config
     
     parser = argparse.ArgumentParser(add_help=False)
-    parser.add_argument('--mcp_port', type=int, default=config.mcp_port,
-                       help='Port for MCP server (default: 8000)')
     parser.add_argument('--grpc_port', type=int, default=config.grpc_port,
                        help='Port for gRPC server (default: 50051)')
     
     try:
         args_list = _parse_parameter_string(parameter)
         parsed_args, _ = parser.parse_known_args(args_list)
-        return PortConfig(mcp_port=parsed_args.mcp_port, grpc_port=parsed_args.grpc_port)
+        return PortConfig(grpc_port=parsed_args.grpc_port)
         
     except (argparse.ArgumentError, SystemExit):
         warnings.warn(f"Could not parse port config from '{parameter}', using defaults", UserWarning)
