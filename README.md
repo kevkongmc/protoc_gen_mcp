@@ -84,14 +84,7 @@ python -m grpc_tools.protoc --proto_path=venv/lib/python3.13/site-packages --pro
 
 ## Development:
 
-### Starting the legacy combined MCP server:
-```bash
-PYTHONPATH=. python helloworld/hello_service_greeter_mcp_server.py
-```
-
-### Running separated servers:
-
-**Option 1: Run standalone gRPC server and MCP proxy separately**
+**Run standalone gRPC server and MCP proxy separately**
 ```bash
 # Terminal 1: Start gRPC server
 PYTHONPATH=. python helloworld/hello_service_greeter_grpc_server.py
